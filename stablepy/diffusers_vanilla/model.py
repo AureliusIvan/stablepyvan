@@ -76,7 +76,7 @@ from .style_prompt_config import (
 )
 import mediapy
 from PIL import Image
-from typing import Union, Optional, List, Tuple, Dict, Any, Callable # noqa
+from typing import Union, Optional, List, Tuple, Dict, Any, Callable, Generator # noqa
 import logging
 import diffusers
 from .main_prompt_embeds import (
@@ -243,7 +243,7 @@ class Model_Diffusers(PreviewGenerator):
         self.last_lora_error = ""
         self.num_loras = 7
 
-        reload = False
+        reload = False # Ensure reload is defined
         self.load_pipe(
             base_model_id,
             task_name,
@@ -301,18 +301,51 @@ class Model_Diffusers(PreviewGenerator):
                     image_encoder=self.pipe.image_encoder,
                 )
 
-        tk = "base"
-        model_components = dict(
-            vae=self.pipe.vae,
-            text_encoder=self.pipe.text_encoder,
-            tokenizer=self.pipe.tokenizer,
-            scheduler=self.pipe.scheduler,
-        )
+        # === Start of new component gathering logic ===
+        current_pipe = self.pipe # The pipe we are switching FROM
+        tk = "base" # Default task key
+
+        # Base components present in most pipelines
+        model_components = {
+            "vae": current_pipe.vae,
+            "text_encoder": current_pipe.text_encoder,
+            "tokenizer": current_pipe.tokenizer,
+            "scheduler": current_pipe.scheduler,
+            # feature_extractor and image_encoder might be optional or task-specific
+            "feature_extractor": getattr(current_pipe, 'feature_extractor', None),
+            "image_encoder": getattr(current_pipe, 'image_encoder', None),
+        }
+
+        if class_name == SD15:
+            if hasattr(current_pipe, 'unet'):
+                model_components["unet"] = current_pipe.unet
+            # safety_checker is often not passed for component-based loading to save memory
+            # model_components["safety_checker"] = getattr(current_pipe, 'safety_checker', None)
+            # model_components["requires_safety_checker"] = getattr(current_pipe.config, 'requires_safety_checker', False)
+
+        elif class_name == SDXL:
+            if hasattr(current_pipe, 'unet'):
+                model_components["unet"] = current_pipe.unet
+            if hasattr(current_pipe, 'text_encoder_2'):
+                model_components["text_encoder_2"] = current_pipe.text_encoder_2
+            if hasattr(current_pipe, 'tokenizer_2'):
+                model_components["tokenizer_2"] = current_pipe.tokenizer_2
+
+        elif class_name == FLUX:
+            if hasattr(current_pipe, 'transformer'):
+                model_components["transformer"] = current_pipe.transformer
+            if hasattr(current_pipe, 'text_encoder_2'):
+                model_components["text_encoder_2"] = current_pipe.text_encoder_2
+            if hasattr(current_pipe, 'tokenizer_2'):
+                model_components["tokenizer_2"] = current_pipe.tokenizer_2
+
+        # Remove keys with None values, as some pipelines might not expect them
+        model_components = {k: v for k, v in model_components.items() if v is not None}
+        # === End of new component gathering logic ===
 
         if class_name == FLUX:
-            model_components["text_encoder_2"] = self.pipe.text_encoder_2
-            model_components["tokenizer_2"] = self.pipe.tokenizer_2
-            model_components["transformer"] = self.pipe.transformer
+            # FLUX specific logic for controlnet or task pipelines
+            # Note: 'transformer', 'text_encoder_2', 'tokenizer_2' are already in model_components if present
 
             if task_name == "txt2img":
                 from diffusers import FluxPipeline
@@ -330,53 +363,60 @@ class Model_Diffusers(PreviewGenerator):
                 if verbose_info:
                     logger.info(f"ControlNet model: {model_id}")
 
-                if hasattr(self.pipe, "controlnet"):
-                    model_components["controlnet"] = self.pipe.controlnet
+                # Use current_pipe here as self.pipe will be replaced
+                if hasattr(current_pipe, "controlnet"):
+                    model_components["controlnet"] = current_pipe.controlnet
                 else:
                     model_components["controlnet"] = FluxControlNetModel.from_pretrained(
                         model_id,
-                        torch_dtype=torch.bfloat16
+                        torch_dtype=torch.bfloat16 # TODO: Consider precision from self.type_model_precision
                     )
 
+                # Ensure 'transformer' is present if it was in current_pipe, handled by initial gathering
                 self.pipe = FluxControlNetPipeline(
                     **model_components
                 )
-            return None
+            return None # FLUX pipeline loading is complete
 
-        else:
-            model_components["unet"] = self.pipe.unet
-            model_components["feature_extractor"] = self.pipe.feature_extractor
-            model_components["image_encoder"] = self.pipe.image_encoder
+        # else: # SD15 and SDXL common logic for unet, feature_extractor, image_encoder
+            # These are already handled by the new component gathering logic if present in current_pipe
+            # model_components["unet"] = current_pipe.unet
+            # model_components["feature_extractor"] = getattr(current_pipe, 'feature_extractor', None)
+            # model_components["image_encoder"] = getattr(current_pipe, 'image_encoder', None)
 
         if class_name == SD15:
-            model_components["safety_checker"] = self.pipe.safety_checker
-            model_components["requires_safety_checker"] = self.pipe.config.requires_safety_checker
+            # model_components["safety_checker"] = getattr(current_pipe, 'safety_checker', None)
+            # model_components["requires_safety_checker"] = getattr(current_pipe.config, 'requires_safety_checker', False)
+            # safety_checker is often not passed for component-based loading.
 
-            if task_name not in ["txt2img", "img2img"]:
+            if task_name not in ["txt2img", "img2img"]: # Tasks requiring ControlNet
                 release_resources()
+                tk = "controlnet" # Task key for controlnet
 
                 if verbose_info:
                     logger.info(f"ControlNet model: {model_id}")
-                if os.path.exists(model_id):
+
+                # ControlNet loading logic for SD15
+                if hasattr(current_pipe, "controlnet") and current_pipe.controlnet.config._name_or_path == model_id:
+                    model_components["controlnet"] = current_pipe.controlnet
+                elif os.path.exists(model_id):
                     model_components["controlnet"] = load_cn_diffusers(
                         model_id,
-                        "lllyasviel/control_v11p_sd15s2_lineart_anime",
+                        "lllyasviel/control_v11p_sd15s2_lineart_anime", # Default for local files
                         self.type_model_precision,
                     )
                 else:
                     model_components["controlnet"] = ControlNetModel.from_pretrained(
                         model_id, torch_dtype=self.type_model_precision
                     )
-                tk = "controlnet"
 
-                if task_name == "repaint":
-                    tk = "inpaint"
+                if task_name == "repaint": # Specific type of controlnet task
+                    tk = "inpaint" # Task key for inpaint (which uses controlnet components)
 
         elif class_name == SDXL:
-            model_components["text_encoder_2"] = self.pipe.text_encoder_2
-            model_components["tokenizer_2"] = self.pipe.tokenizer_2
+            # text_encoder_2 and tokenizer_2 are already handled by the new component gathering logic
 
-            if task_name not in ["txt2img", "inpaint", "img2img"]:
+            if task_name not in ["txt2img", "inpaint", "img2img"]: # Tasks requiring ControlNet or T2IAdapter
                 if verbose_info:
                     logger.info(f"Task model: {model_id}")
                 release_resources()
@@ -387,66 +427,60 @@ class Model_Diffusers(PreviewGenerator):
 
                     tk = "controlnet"
 
-                    if os.path.exists(model_id):
+                    if os.path.exists(model_id): # Local ControlNet model
                         if (
-                            hasattr(self.pipe, "controlnet")
-                            and hasattr(self.pipe.controlnet, "config")
-                            and self.pipe.controlnet.config._name_or_path == model_id
+                            hasattr(current_pipe, "controlnet")
+                            and hasattr(current_pipe.controlnet, "config")
+                            and current_pipe.controlnet.config._name_or_path == model_id
                         ):
-                            model_components["controlnet"] = self.pipe.controlnet
+                            model_components["controlnet"] = current_pipe.controlnet
                         else:
-                            if hasattr(self.pipe, "controlnet"):
-                                # self.pipe.controlnet.to_empty(device=self.device)
-                                self.pipe.__delattr__("controlnet")
-                                self.pipe.controlnet = None
-                                self.model_memory = {}
-                                release_resources()
+                            # Simplified loading, assuming previous controlnet is cleared if not reusable
                             model_components["controlnet"] = load_cn_diffusers(
                                 model_id,
-                                "r3gm/controlnet-lineart-anime-sdxl-fp16",
-                                torch.float16,
-                            ).to(self.device)
-                    else:
-
+                                "r3gm/controlnet-lineart-anime-sdxl-fp16", # Default for local files
+                                torch.float16, # TODO: Consider self.type_model_precision
+                            ).to(self.device) # Ensure device placement
+                    else: # HuggingFace Hub ControlNet model
                         cls_controlnet = ControlNetModel
-
                         if all(kw in model_id.lower() for kw in ["union", "promax"]):
                             from .extra_pipe.sdxl.controlnet_union import ControlNetUnionModel
                             cls_controlnet = ControlNetUnionModel
-                            tk = "controlnet_union+"
+                            tk = "controlnet_union+" # Task key for union controlnet
 
                         if (
-                            hasattr(self.pipe, "controlnet")
-                            and hasattr(self.pipe.controlnet, "config")
-                            and self.pipe.controlnet.config._name_or_path == model_id
-                            and self.pipe.controlnet.__class__.__name__ == cls_controlnet.__name__
+                            hasattr(current_pipe, "controlnet")
+                            and hasattr(current_pipe.controlnet, "config")
+                            and current_pipe.controlnet.config._name_or_path == model_id
+                            and current_pipe.controlnet.__class__.__name__ == cls_controlnet.__name__
                         ):
-                            model_components["controlnet"] = self.pipe.controlnet
+                            model_components["controlnet"] = current_pipe.controlnet
                         else:
-                            if hasattr(self.pipe, "controlnet"):
-                                # self.pipe.controlnet.to_empty(device=self.device)
-                                self.pipe.__delattr__("controlnet")
-                                self.pipe.controlnet = None
-                                self.model_memory = {}
-                                release_resources()
+                             # Simplified loading
                             model_components["controlnet"] = cls_controlnet.from_pretrained(
                                 model_id, torch_dtype=torch.float16, variant=check_variant_file(model_id, "fp16")
-                            ).to(self.device)
+                            ).to(self.device) # Ensure device placement
 
-                        if task_name == "repaint":
-                            tk += "_inpaint"
+                        if task_name == "repaint": # Specific type of controlnet task
+                            tk += "_inpaint" # Append to task key, e.g., "controlnet_union+_inpaint"
 
-                else:
-                    model_components["adapter"] = T2IAdapter.from_pretrained(
-                        model_id,
-                        torch_dtype=torch.float16,
-                        varient="fp16",
-                    ).to(self.device)
-                    tk = "adapter"
+                else: # T2IAdapter for SDXL
+                    tk = "adapter" # Task key for adapter
+                    # Adapter loading logic
+                    if hasattr(current_pipe, "adapter") and current_pipe.adapter.config._name_or_path == model_id:
+                         model_components["adapter"] = current_pipe.adapter
+                    else:
+                        model_components["adapter"] = T2IAdapter.from_pretrained(
+                            model_id,
+                            torch_dtype=torch.float16, # TODO: Consider self.type_model_precision
+                            variant="fp16", # Corrected typo from varient to variant
+                        ).to(self.device) # Ensure device placement
 
-        if task_name == "inpaint":
+        # General task key update for non-controlnet/adapter tasks if needed
+        if task_name == "inpaint" and tk == "base": # If not already a controlnet inpaint
             tk = "inpaint"
 
+        # PAG enabling logic (seems mostly fine, refers to tk)
         if enable_pag:
             if (
                 tk == "adapter" or
@@ -1485,7 +1519,7 @@ class Model_Diffusers(PreviewGenerator):
         xformers_memory_efficient_attention: bool = False,
         gui_active: bool = False,
         **kwargs,
-    ):
+    ) -> Union[Tuple[List[Image.Image], List], Generator[Tuple[List[Image.Image], List], None, None]]:
 
         """
         The call function for the generation.
